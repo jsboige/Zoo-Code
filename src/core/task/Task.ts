@@ -141,6 +141,11 @@ const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
 const FORCED_CONTEXT_REDUCTION_PERCENT = 75 // Keep 75% of context (remove 25%) on context window errors
 const MAX_CONTEXT_WINDOW_RETRIES = 3 // Maximum retries for context window errors
+// #3195: the auto-approval retry path recursed with no ceiling — a persistent 429/401
+// retried forever (observed: 17 retries ≈ 2 h 50, 48 ≈ 8 h). 10 retries bounds the
+// wait to ~40 min (exponential backoff caps at 600 s) while riding out any transient
+// outage shorter than ~20 min. Fails loudly at the cap instead of aborting silently.
+const MAX_AUTO_APPROVAL_RETRIES = 10
 
 export interface TaskOptions extends CreateTaskOptions {
 	provider: ClineProvider
@@ -4425,6 +4430,16 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 			// note that this api_req_failed ask is unique in that we only present this option if the api hasn't streamed any content yet (ie it fails on the first chunk due), as it would allow them to hit a retry button. However if the api failed mid-stream, it could be in any arbitrary state where some tools may have executed, so that error is handled differently and requires cancelling the task entirely.
 			if (autoApprovalEnabled) {
+				// #3195: bound the loop. Without this ceiling the recursive call below
+				// never stops — the exponential backoff caps each DELAY, not the NUMBER
+				// of retries, so a persistent 429/401 only ever ended via abort.
+				if (retryAttempt >= MAX_AUTO_APPROVAL_RETRIES) {
+					const lastError = error instanceof Error ? error.message : String(error)
+					throw new Error(
+						`[Task#attemptApiRequest] task ${this.taskId}.${this.instanceId} aborted: auto-retry limit reached (${MAX_AUTO_APPROVAL_RETRIES} attempts) — last error: ${lastError}`,
+					)
+				}
+
 				// Apply shared exponential backoff and countdown UX
 				await this.backoffAndAnnounce(retryAttempt, error)
 

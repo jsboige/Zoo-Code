@@ -465,6 +465,79 @@ describe("Cline", () => {
 		})
 	})
 
+	describe("auto-approval retry cap (#3195)", () => {
+		// The auto-approval branch of attemptApiRequest recursed with no ceiling: the
+		// exponential backoff caps each DELAY, never the NUMBER of retries, so a
+		// persistent 429/401 only ever ended via abort (observed 17 retries ≈ 2 h 50,
+		// 48 ≈ 8 h). The cap fails loudly, naming the last error.
+		const rateLimitError = Object.assign(new Error("429 Too Many Requests"), { status: 429 })
+
+		function throwingStream(): AsyncGenerator<ApiStreamChunk> {
+			return (async function* () {
+				// Empty yield* keeps require-yield satisfied; the first next() still rejects.
+				yield* [] as ApiStreamChunk[]
+				throw rateLimitError
+			})()
+		}
+
+		function makeAutoRetryTask(autoApprovalEnabled: boolean): Task {
+			vi.spyOn(mockProvider, "getState").mockResolvedValue({
+				mode: "code",
+				mcpEnabled: false,
+				autoApprovalEnabled,
+				requestDelaySeconds: 0,
+			} as unknown as ProviderState)
+			const task = new Task({
+				provider: mockProvider,
+				apiConfiguration: mockApiConfig,
+				task: "test task",
+				startTask: false,
+			})
+			vi.spyOn(getTaskTestAccess(task), "getSystemPrompt").mockResolvedValue("mock system prompt")
+			return task
+		}
+
+		it("fails loudly at the cap instead of recursing — no further request, last error named", async () => {
+			const task = makeAutoRetryTask(true)
+			task.apiConversationHistory = [
+				{ role: "user", content: [{ type: "text", text: "test message" }], ts: Date.now() },
+			]
+			const createMessage = vi.spyOn(task.api, "createMessage").mockImplementation(throwingStream)
+
+			const attempt = task.attemptApiRequest(10).next()
+
+			// The number in the message self-guards the constant: changing
+			// MAX_AUTO_APPROVAL_RETRIES away from 10 breaks this match.
+			await expect(attempt).rejects.toThrow("auto-retry limit reached (10 attempts)")
+			await expect(attempt).rejects.toThrow("429 Too Many Requests")
+			expect(createMessage).toHaveBeenCalledTimes(1)
+		})
+
+		it("still retries below the cap — the guard bounds the loop, it does not shorten it", async () => {
+			const task = makeAutoRetryTask(true)
+			task.apiConversationHistory = [
+				{ role: "user", content: [{ type: "text", text: "test message" }], ts: Date.now() },
+			]
+			const createMessage = vi.spyOn(task.api, "createMessage").mockImplementation(throwingStream)
+
+			// Attempt 9 recurses into 10, which hits the cap: the rejection is the cap's,
+			// but TWO requests were made — the legitimate retry happened.
+			await expect(task.attemptApiRequest(9).next()).rejects.toThrow("auto-retry limit reached")
+			expect(createMessage).toHaveBeenCalledTimes(2)
+		})
+
+		it("leaves the interactive (ask) path untouched — the guard lives in the auto-approval branch only", async () => {
+			const task = makeAutoRetryTask(false)
+			task.apiConversationHistory = [
+				{ role: "user", content: [{ type: "text", text: "test message" }], ts: Date.now() },
+			]
+			vi.spyOn(task.api, "createMessage").mockImplementation(throwingStream)
+			vi.spyOn(task, "ask").mockResolvedValue({ response: "noButtonClicked" } satisfies TaskAskResult)
+
+			await expect(task.attemptApiRequest(10).next()).rejects.toThrow("API request failed")
+		})
+	})
+
 	describe("constructor", () => {
 		it("should always have diff strategy defined", async () => {
 			const cline = new Task({
