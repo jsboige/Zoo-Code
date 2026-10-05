@@ -1,6 +1,8 @@
 import * as vscode from "vscode"
 import * as path from "path"
 import * as os from "os"
+import fs from "fs/promises"
+import { createHash } from "crypto"
 
 import { Package } from "../shared/package"
 import { fileExistsAtPath } from "./fs"
@@ -36,6 +38,26 @@ export async function autoImportSettings(
 			return
 		}
 
+		// Skip the import entirely (and its notification) when the file is unchanged
+		// since the last successful import. Auto-import runs at every activation, so
+		// without this guard each window reload re-imports the same file and re-shows
+		// the same notification. The SHA-256 of the file content is kept in global
+		// state under "autoImportLastImportHash".
+		let fileHash: string | undefined
+		try {
+			const content = await fs.readFile(resolvedPath, "utf-8")
+			fileHash = createHash("sha256").update(content).digest("hex")
+		} catch {
+			// Hashing is best-effort: on failure fall through and import as before.
+		}
+
+		if (fileHash && fileHash === contextProxy.getValue("autoImportLastImportHash")) {
+			outputChannel.appendLine(
+				"[AutoImport] Settings file unchanged since the last successful import, skipping auto-import",
+			)
+			return
+		}
+
 		// Attempt to import the configuration
 		const result = await importSettingsFromPath(resolvedPath, {
 			providerSettingsManager,
@@ -54,6 +76,11 @@ export async function autoImportSettings(
 				for (const warning of result.warnings) {
 					outputChannel.appendLine(`[AutoImport] Warning: ${warning}`)
 				}
+			}
+
+			// Record the imported content so later activations can skip a re-import.
+			if (fileHash) {
+				await contextProxy.setValue("autoImportLastImportHash", fileHash)
 			}
 
 			// Show a notification to the user

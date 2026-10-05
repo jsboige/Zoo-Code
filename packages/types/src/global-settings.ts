@@ -109,6 +109,9 @@ export const globalSettingsSchema = z.object({
 	pinnedApiConfigs: z.record(z.string(), z.boolean()).optional(),
 
 	lastShownAnnouncementId: z.string().optional(),
+	// Internal marker: SHA-256 of the last successfully auto-imported settings file.
+	// Not a user setting; omitted from settings export.
+	autoImportLastImportHash: z.string().optional(),
 	customInstructions: z.string().optional(),
 	taskHistory: z.array(historyItemSchema).optional(),
 	dismissedUpsells: z.array(z.string()).optional(),

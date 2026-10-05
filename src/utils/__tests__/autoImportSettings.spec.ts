@@ -108,6 +108,7 @@ describe("autoImportSettings", () => {
 
 		// Mock context proxy
 		mockContextProxy = {
+			getValue: vi.fn(),
 			setValues: vi.fn().mockResolvedValue(undefined),
 			setValue: vi.fn().mockResolvedValue(undefined),
 			setProviderSettings: vi.fn().mockResolvedValue(undefined),
@@ -221,6 +222,120 @@ describe("autoImportSettings", () => {
 		expect(vscode.window.showInformationMessage).toHaveBeenCalledWith("info.auto_import_success")
 		expect(mockProviderSettingsManager.import).toHaveBeenCalled()
 		expect(mockContextProxy.setValues).toHaveBeenCalled()
+	})
+
+	it("should skip auto-import when the settings file is unchanged since the last successful import", async () => {
+		const settingsPath = "/absolute/path/to/config.json"
+		vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
+			get: vi.fn().mockReturnValue(settingsPath),
+		} as unknown as vscode.WorkspaceConfiguration)
+
+		vi.mocked(fileExistsAtPath).mockResolvedValue(true)
+
+		const mockSettings = {
+			providerProfiles: {
+				currentApiConfigName: "test-config",
+				apiConfigs: {
+					"test-config": {
+						apiProvider: providerIdentifiers.anthropic,
+						anthropicApiKey: "test-key",
+					},
+				},
+			},
+			globalSettings: {
+				customInstructions: "Test instructions",
+			},
+		}
+
+		vi.mocked(fsPromises.readFile).mockResolvedValue(JSON.stringify(mockSettings) as unknown as string)
+
+		// Persist the hash the same way the implementation does: through the context proxy.
+		let storedHash: string | undefined
+		mockContextProxy.getValue.mockImplementation((key: string) =>
+			key === "autoImportLastImportHash" ? storedHash : undefined,
+		)
+		mockContextProxy.setValue.mockImplementation(async (key: string, value: unknown) => {
+			if (key === "autoImportLastImportHash") {
+				storedHash = value as string
+			}
+		})
+
+		const importOptions = {
+			providerSettingsManager: mockProviderSettingsManager,
+			contextProxy: mockContextProxy,
+			customModesManager: mockCustomModesManager,
+		}
+
+		// First activation: the file imports and its hash is recorded.
+		await autoImportSettings(mockOutputChannel, importOptions)
+
+		expect(mockProviderSettingsManager.import).toHaveBeenCalledTimes(1)
+		expect(mockContextProxy.setValue).toHaveBeenCalledWith("autoImportLastImportHash", expect.any(String))
+
+		// Second activation, same file: no re-import and no second notification.
+		await autoImportSettings(mockOutputChannel, importOptions)
+
+		expect(mockOutputChannel.appendLine).toHaveBeenCalledWith(
+			"[AutoImport] Settings file unchanged since the last successful import, skipping auto-import",
+		)
+		expect(mockProviderSettingsManager.import).toHaveBeenCalledTimes(1)
+		expect(vscode.window.showInformationMessage).toHaveBeenCalledTimes(1)
+	})
+
+	it("should re-import when the settings file changed since the last successful import", async () => {
+		const settingsPath = "/absolute/path/to/config.json"
+		vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
+			get: vi.fn().mockReturnValue(settingsPath),
+		} as unknown as vscode.WorkspaceConfiguration)
+
+		vi.mocked(fileExistsAtPath).mockResolvedValue(true)
+
+		let customInstructions = "First version"
+
+		const buildSettings = () => ({
+			providerProfiles: {
+				currentApiConfigName: "test-config",
+				apiConfigs: {
+					"test-config": {
+						apiProvider: providerIdentifiers.anthropic,
+						anthropicApiKey: "test-key",
+					},
+				},
+			},
+			globalSettings: {
+				customInstructions,
+			},
+		})
+
+		vi.mocked(fsPromises.readFile).mockImplementation(
+			async () => JSON.stringify(buildSettings()) as unknown as string,
+		)
+
+		let storedHash: string | undefined
+		mockContextProxy.getValue.mockImplementation((key: string) =>
+			key === "autoImportLastImportHash" ? storedHash : undefined,
+		)
+		mockContextProxy.setValue.mockImplementation(async (key: string, value: unknown) => {
+			if (key === "autoImportLastImportHash") {
+				storedHash = value as string
+			}
+		})
+
+		const importOptions = {
+			providerSettingsManager: mockProviderSettingsManager,
+			contextProxy: mockContextProxy,
+			customModesManager: mockCustomModesManager,
+		}
+
+		await autoImportSettings(mockOutputChannel, importOptions)
+		expect(mockProviderSettingsManager.import).toHaveBeenCalledTimes(1)
+
+		customInstructions = "Second version"
+
+		await autoImportSettings(mockOutputChannel, importOptions)
+
+		expect(mockProviderSettingsManager.import).toHaveBeenCalledTimes(2)
+		expect(vscode.window.showInformationMessage).toHaveBeenCalledTimes(2)
 	})
 
 	it("should log import warnings while still succeeding", async () => {
