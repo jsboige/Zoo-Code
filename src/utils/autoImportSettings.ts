@@ -1,12 +1,30 @@
 import * as vscode from "vscode"
 import * as path from "path"
 import * as os from "os"
+import * as crypto from "crypto"
+import * as fs from "fs/promises"
 
 import { Package } from "../shared/package"
 import { fileExistsAtPath } from "./fs"
 import { t } from "../i18n"
 
 import { importSettingsFromPath, ImportOptions } from "../core/config/importExport"
+
+// Key used to store the hash of the last successfully imported settings file in globalState.
+// It is only used to decide whether the success notification is worth raising: the import
+// itself runs on every activation on purpose (see below).
+// Deliberately kept out of ContextProxy/GlobalState: this is internal bookkeeping, not a
+// user-facing setting, and it must not leak into the export/import settings schema.
+const LAST_IMPORT_HASH_KEY = "zooCode.lastAutoImportHash"
+
+function sha256Hex(s: string): string {
+	return crypto.createHash("sha256").update(s, "utf-8").digest("hex")
+}
+
+export type AutoImportOptions = ImportOptions & {
+	/** Extension context, used to remember the last imported file hash across activations. */
+	context: vscode.ExtensionContext
+}
 
 /**
  * Automatically imports RooCode settings from a specified path if it exists.
@@ -15,7 +33,7 @@ import { importSettingsFromPath, ImportOptions } from "../core/config/importExpo
  */
 export async function autoImportSettings(
 	outputChannel: vscode.OutputChannel,
-	{ providerSettingsManager, contextProxy, customModesManager }: ImportOptions,
+	{ providerSettingsManager, contextProxy, customModesManager, context }: AutoImportOptions,
 ): Promise<void> {
 	try {
 		// Get the auto-import settings path from VSCode settings
@@ -36,6 +54,16 @@ export async function autoImportSettings(
 			return
 		}
 
+		// Hash the file so we can tell whether it changed since the last successful import.
+		// The import below still runs on EVERY activation on purpose: it is the self-healing
+		// path that re-asserts a known-good config after Zoo flushes its in-memory state on
+		// exit (the durable fix for that race is the autoImport path itself). Skipping an
+		// unchanged import would defeat it, so only the notification is gated.
+		const fileContent = await fs.readFile(resolvedPath, "utf-8")
+		const fileHash = sha256Hex(fileContent)
+		const lastImportHash = context.globalState.get<string>(LAST_IMPORT_HASH_KEY)
+		const contentUnchanged = lastImportHash !== undefined && lastImportHash === fileHash
+
 		// Attempt to import the configuration
 		const result = await importSettingsFromPath(resolvedPath, {
 			providerSettingsManager,
@@ -45,6 +73,13 @@ export async function autoImportSettings(
 
 		if (result.success) {
 			outputChannel.appendLine(`[AutoImport] Successfully imported settings from ${resolvedPath}`)
+
+			// Remember the imported hash so the next activation recognises an unchanged file
+			try {
+				await context.globalState.update(LAST_IMPORT_HASH_KEY, fileHash)
+			} catch {
+				// Non-fatal: a missing/broken globalState never blocks the import itself
+			}
 
 			if (result.warnings && result.warnings.length > 0) {
 				const count = result.warnings.length
@@ -56,10 +91,17 @@ export async function autoImportSettings(
 				}
 			}
 
-			// Show a notification to the user
-			vscode.window.showInformationMessage(
-				t("common:info.auto_import_success", { filename: path.basename(resolvedPath) }),
-			)
+			// Only notify when the config actually changed: re-applying an unchanged file is
+			// deliberate (see above), but raising a toast for it on every restart is not.
+			if (contentUnchanged) {
+				outputChannel.appendLine(
+					`[AutoImport] Settings unchanged since last import; re-applied without notification`,
+				)
+			} else {
+				vscode.window.showInformationMessage(
+					t("common:info.auto_import_success", { filename: path.basename(resolvedPath) }),
+				)
+			}
 		} else {
 			outputChannel.appendLine(`[AutoImport] Failed to import settings: ${result.error}`)
 

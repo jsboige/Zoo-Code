@@ -249,6 +249,7 @@ export async function activate(context: vscode.ExtensionContext) {
 			providerSettingsManager: provider.providerSettingsManager,
 			contextProxy: provider.contextProxy,
 			customModesManager: provider.customModesManager,
+			context,
 		})
 	} catch (error) {
 		outputChannel.appendLine(

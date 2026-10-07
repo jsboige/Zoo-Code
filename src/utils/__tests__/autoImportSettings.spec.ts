@@ -9,13 +9,20 @@ vi.mock("vscode", () => ({
 	},
 }))
 
-vi.mock("fs/promises", () => ({
-	__esModule: true,
-	default: {
-		readFile: vi.fn(),
-	},
-	readFile: vi.fn(),
-}))
+// Deterministic hash helper for the tests (mirrors the production sha256 of the file content)
+import * as crypto from "crypto"
+function sha256(s: string): string {
+	return crypto.createHash("sha256").update(s, "utf-8").digest("hex")
+}
+
+vi.mock("fs/promises", () => {
+	const readFile = vi.fn()
+	return {
+		__esModule: true,
+		default: { readFile },
+		readFile,
+	}
+})
 
 vi.mock("path", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("path")>()
@@ -85,6 +92,9 @@ describe("autoImportSettings", () => {
 	let mockCustomModesManager: any
 	let mockOutputChannel: any
 	let mockProvider: any
+	let mockContext: vscode.ExtensionContext
+	// Exposed so tests can pre-seed / assert the last-imported hash
+	let globalStateStore: Map<string, unknown>
 
 	beforeEach(() => {
 		// Reset all mocks
@@ -106,7 +116,16 @@ describe("autoImportSettings", () => {
 			listConfig: vi.fn().mockResolvedValue([]),
 		}
 
-		// Mock context proxy
+		// Mock context proxy (with a globalState gate store)
+		globalStateStore = new Map<string, unknown>()
+		mockContext = {
+			globalState: {
+				get: vi.fn((key: string) => globalStateStore.get(key)),
+				update: vi.fn(async (key: string, value: unknown) => {
+					globalStateStore.set(key, value)
+				}),
+			},
+		} as unknown as vscode.ExtensionContext
 		mockContextProxy = {
 			setValues: vi.fn().mockResolvedValue(undefined),
 			setValue: vi.fn().mockResolvedValue(undefined),
@@ -147,6 +166,7 @@ describe("autoImportSettings", () => {
 			providerSettingsManager: mockProviderSettingsManager,
 			contextProxy: mockContextProxy,
 			customModesManager: mockCustomModesManager,
+			context: mockContext,
 		})
 
 		expect(mockOutputChannel.appendLine).toHaveBeenCalledWith(
@@ -168,6 +188,7 @@ describe("autoImportSettings", () => {
 			providerSettingsManager: mockProviderSettingsManager,
 			contextProxy: mockContextProxy,
 			customModesManager: mockCustomModesManager,
+			context: mockContext,
 		})
 
 		expect(mockOutputChannel.appendLine).toHaveBeenCalledWith(
@@ -204,12 +225,13 @@ describe("autoImportSettings", () => {
 			},
 		}
 
-		vi.mocked(fsPromises.readFile).mockResolvedValue(JSON.stringify(mockSettings) as any)
+		vi.mocked(fsPromises.readFile).mockResolvedValue(JSON.stringify(mockSettings))
 
 		await autoImportSettings(mockOutputChannel, {
 			providerSettingsManager: mockProviderSettingsManager,
 			contextProxy: mockContextProxy,
 			customModesManager: mockCustomModesManager,
+			context: mockContext,
 		})
 
 		expect(mockOutputChannel.appendLine).toHaveBeenCalledWith(
@@ -221,6 +243,103 @@ describe("autoImportSettings", () => {
 		expect(vscode.window.showInformationMessage).toHaveBeenCalledWith("info.auto_import_success")
 		expect(mockProviderSettingsManager.import).toHaveBeenCalled()
 		expect(mockContextProxy.setValues).toHaveBeenCalled()
+	})
+
+	// --- Notification gate on unchanged content (red-first, Refs #4025) ---
+
+	it("should re-import but stay quiet when the file hash equals the last successful import", async () => {
+		const settingsPath = "/absolute/path/to/config.json"
+		vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
+			get: vi.fn().mockReturnValue(settingsPath),
+		} as any)
+		vi.mocked(fileExistsAtPath).mockResolvedValue(true)
+
+		const mockSettings = {
+			providerProfiles: {
+				currentApiConfigName: "test-config",
+				apiConfigs: {
+					"test-config": { apiProvider: providerIdentifiers.anthropic, anthropicApiKey: "test-key" },
+				},
+			},
+		}
+		const content = JSON.stringify(mockSettings)
+		vi.mocked(fsPromises.readFile).mockResolvedValue(content)
+
+		// Pre-seed the last-imported hash in globalState (same content = already imported)
+		globalStateStore.set("zooCode.lastAutoImportHash", sha256(content))
+
+		await autoImportSettings(mockOutputChannel, {
+			providerSettingsManager: mockProviderSettingsManager,
+			contextProxy: mockContextProxy,
+			customModesManager: mockCustomModesManager,
+			context: mockContext,
+		})
+
+		// The import must still run (it is the self-healing path), but no notification must fire
+		expect(mockProviderSettingsManager.import).toHaveBeenCalled()
+		expect(vscode.window.showInformationMessage).not.toHaveBeenCalled()
+		expect(mockOutputChannel.appendLine).toHaveBeenCalledWith(
+			expect.stringContaining("unchanged since last import"),
+		)
+	})
+
+	it("should re-import when file hash differs from last successful import", async () => {
+		const settingsPath = "/absolute/path/to/config.json"
+		vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
+			get: vi.fn().mockReturnValue(settingsPath),
+		} as any)
+		vi.mocked(fileExistsAtPath).mockResolvedValue(true)
+
+		const mockSettings = {
+			providerProfiles: {
+				currentApiConfigName: "test-config",
+				apiConfigs: {
+					"test-config": { apiProvider: providerIdentifiers.anthropic, anthropicApiKey: "new-key" },
+				},
+			},
+		}
+		vi.mocked(fsPromises.readFile).mockResolvedValue(JSON.stringify(mockSettings))
+
+		// Different hash in globalState (older import)
+		globalStateStore.set("zooCode.lastAutoImportHash", sha256('{"different":"content"}'))
+
+		await autoImportSettings(mockOutputChannel, {
+			providerSettingsManager: mockProviderSettingsManager,
+			contextProxy: mockContextProxy,
+			customModesManager: mockCustomModesManager,
+			context: mockContext,
+		})
+
+		expect(mockProviderSettingsManager.import).toHaveBeenCalled()
+		expect(vscode.window.showInformationMessage).toHaveBeenCalledWith("info.auto_import_success")
+	})
+
+	it("should store the file hash in globalState after a successful import", async () => {
+		const settingsPath = "/absolute/path/to/config.json"
+		vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
+			get: vi.fn().mockReturnValue(settingsPath),
+		} as any)
+		vi.mocked(fileExistsAtPath).mockResolvedValue(true)
+
+		const mockSettings = {
+			providerProfiles: {
+				currentApiConfigName: "test-config",
+				apiConfigs: {
+					"test-config": { apiProvider: providerIdentifiers.anthropic, anthropicApiKey: "test-key" },
+				},
+			},
+		}
+		const content = JSON.stringify(mockSettings)
+		vi.mocked(fsPromises.readFile).mockResolvedValue(content)
+
+		await autoImportSettings(mockOutputChannel, {
+			providerSettingsManager: mockProviderSettingsManager,
+			contextProxy: mockContextProxy,
+			customModesManager: mockCustomModesManager,
+			context: mockContext,
+		})
+
+		expect(mockContext.globalState.update).toHaveBeenCalledWith("zooCode.lastAutoImportHash", sha256(content))
 	})
 
 	it("should log import warnings while still succeeding", async () => {
@@ -247,12 +366,13 @@ describe("autoImportSettings", () => {
 			},
 		}
 
-		vi.mocked(fsPromises.readFile).mockResolvedValue(JSON.stringify(mockSettings) as any)
+		vi.mocked(fsPromises.readFile).mockResolvedValue(JSON.stringify(mockSettings))
 
 		await autoImportSettings(mockOutputChannel, {
 			providerSettingsManager: mockProviderSettingsManager,
 			contextProxy: mockContextProxy,
 			customModesManager: mockCustomModesManager,
+			context: mockContext,
 		})
 
 		expect(mockOutputChannel.appendLine).toHaveBeenCalledWith(
@@ -281,12 +401,13 @@ describe("autoImportSettings", () => {
 		vi.mocked(fileExistsAtPath).mockResolvedValue(true)
 
 		// Mock fs.readFile to return invalid JSON
-		vi.mocked(fsPromises.readFile).mockResolvedValue("invalid json" as any)
+		vi.mocked(fsPromises.readFile).mockResolvedValue("invalid json")
 
 		await autoImportSettings(mockOutputChannel, {
 			providerSettingsManager: mockProviderSettingsManager,
 			contextProxy: mockContextProxy,
 			customModesManager: mockCustomModesManager,
+			context: mockContext,
 		})
 
 		expect(mockOutputChannel.appendLine).toHaveBeenCalledWith(
@@ -311,6 +432,7 @@ describe("autoImportSettings", () => {
 			providerSettingsManager: mockProviderSettingsManager,
 			contextProxy: mockContextProxy,
 			customModesManager: mockCustomModesManager,
+			context: mockContext,
 		})
 
 		expect(mockOutputChannel.appendLine).toHaveBeenCalledWith(
@@ -331,6 +453,7 @@ describe("autoImportSettings", () => {
 			providerSettingsManager: mockProviderSettingsManager,
 			contextProxy: mockContextProxy,
 			customModesManager: mockCustomModesManager,
+			context: mockContext,
 		})
 
 		expect(mockOutputChannel.appendLine).toHaveBeenCalledWith(
@@ -351,6 +474,7 @@ describe("autoImportSettings", () => {
 			providerSettingsManager: mockProviderSettingsManager,
 			contextProxy: mockContextProxy,
 			customModesManager: mockCustomModesManager,
+			context: mockContext,
 		})
 
 		expect(mockOutputChannel.appendLine).toHaveBeenCalledWith(
